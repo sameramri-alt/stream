@@ -1,0 +1,27 @@
+# ============================================================
+# .gitignore — Fichiers à ne PAS envoyer sur GitHub
+# ============================================================
+
+# Variables d'environnement (contient des mots de passe !)
+.env
+
+# Données MinIO locales (trop lourdes pour GitHub)
+minio_data/
+
+# Fichiers Python temporaires
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+
+# Logs
+*.log
+
+# Système d'exploitation
+.DS_Store           # macOS
+Thumbs.db           # Windows
+
+# IDEs
+.vscode/
+.idea/
+*.swp

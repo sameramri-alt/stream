@@ -1,0 +1,241 @@
+# ============================================================
+# docker-compose.yml — Orchestration de toute l'infrastructure
+# Commande pour démarrer : docker-compose up -d
+# Commande pour arrêter  : docker-compose down
+# ============================================================
+
+# =============================================================
+# RÉSEAU PARTAGÉ — Tous les conteneurs se parlent par leur nom
+# Ex: le producer se connecte à "redpanda:9092"
+# =============================================================
+networks:
+  lakehouse-net:
+    driver: bridge
+
+# =============================================================
+# VOLUMES — Données persistantes (survivent au redémarrage)
+# =============================================================
+volumes:
+  minio_data:       # Stocke les tables Delta Lake (Bronze, Silver, Gold)
+  redpanda_data:    # Stocke les messages Redpanda
+
+# =============================================================
+# SERVICES — Les 8 "programmes" qui tournent en parallèle
+# =============================================================
+services:
+
+  # -----------------------------------------------------------
+  # SERVICE 1 : REDPANDA (Message Broker)
+  # Rôle : Reçoit les messages du Producer Python
+  #        et les distribue à PySpark
+  # Interface web : http://localhost:8080
+  # -----------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:v23.3.11
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "512M"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:9092
+      - --pandaproxy-addr
+      - 0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - redpanda:8082
+      - --schema-registry-addr
+      - 0.0.0.0:8081
+      - --rpc-addr
+      - 0.0.0.0:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+    ports:
+      - "9092:9092"   # API Kafka (utilisée par Python et Spark)
+      - "9644:9644"   # Admin API Redpanda
+      - "8082:8082"   # Pandaproxy REST
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # -----------------------------------------------------------
+  # SERVICE 2 : REDPANDA CONSOLE (Interface Web)
+  # Rôle : Voir les topics, les messages, les consumers
+  # Interface web : http://localhost:8080
+  # -----------------------------------------------------------
+  redpanda-console:
+    image: redpandadata/console:v2.4.3
+    container_name: redpanda-console
+    environment:
+      KAFKA_BROKERS: "redpanda:9092"
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: "http://redpanda:8081"
+      REDPANDA_ADMINAPI_ENABLED: "true"
+      REDPANDA_ADMINAPI_URLS: "http://redpanda:9644"
+    ports:
+      - "8080:8080"   # Interface web Redpanda Console
+    networks:
+      - lakehouse-net
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # -----------------------------------------------------------
+  # SERVICE 3 : MINIO (Stockage Objet S3 Local)
+  # Rôle : Stocker les tables Delta Lake (Bronze, Silver, Gold)
+  #        et les checkpoints Spark
+  # Interface web : http://localhost:9001
+  # Login : minioadmin / minioadmin123
+  # -----------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API S3 (utilisée par Spark et DuckDB)
+      - "9001:9001"   # Console Web MinIO
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # -----------------------------------------------------------
+  # SERVICE 4 : MINIO INIT (Création des Buckets)
+  # Rôle : Crée le bucket "lakehouse" au premier démarrage
+  #        Ce service s'exécute une seule fois puis s'arrête
+  # -----------------------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    networks:
+      - lakehouse-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo '🚀 Initialisation de MinIO...';
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb local/lakehouse --ignore-existing;
+      mc mb local/lakehouse/bronze --ignore-existing;
+      mc mb local/lakehouse/silver --ignore-existing;
+      mc mb local/lakehouse/gold --ignore-existing;
+      mc mb local/lakehouse/checkpoints --ignore-existing;
+      echo '✅ Buckets créés avec succès !';
+      "
+
+  # -----------------------------------------------------------
+  # SERVICE 5 : SPARK MASTER (Chef d'orchestre Spark)
+  # Rôle : Coordonne les Spark Workers, reçoit les jobs
+  # Interface web : http://localhost:8081
+  # -----------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: spark-master
+    # Lance Spark en mode Master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    ports:
+      - "8081:8080"   # Spark Master Web UI (le port interne est 8080)
+      - "7077:7077"   # Port de connexion pour les workers et jobs
+    networks:
+      - lakehouse-net
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs  # Monte les fichiers Python dans Spark
+
+  # -----------------------------------------------------------
+  # SERVICE 6 : SPARK WORKER (Le moteur qui fait le calcul)
+  # Rôle : Exécute les tâches assignées par Spark Master
+  # Interface web : http://localhost:8083
+  # -----------------------------------------------------------
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    # Lance Spark en mode Worker et se connecte au Master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_WORKER_MEMORY=2g      # 2 Go de RAM pour le traitement
+      - SPARK_WORKER_CORES=2        # 2 cœurs CPU
+    ports:
+      - "8083:8081"   # Spark Worker Web UI (le port interne est 8081)
+    networks:
+      - lakehouse-net
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+
+  # -----------------------------------------------------------
+  # SERVICE 7 : PRODUCER PYTHON (Ingestion Wikipedia)
+  # Rôle : Lit le flux SSE Wikipedia et publie dans Redpanda
+  # Construit depuis : ./producer/Dockerfile
+  # -----------------------------------------------------------
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: wikimedia-producer
+    environment:
+      - REDPANDA_BROKERS=${REDPANDA_BROKERS}
+      - KAFKA_TOPIC=${KAFKA_TOPIC}
+      - WIKIMEDIA_SSE_URL=${WIKIMEDIA_SSE_URL}
+    networks:
+      - lakehouse-net
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: on-failure  # Redémarre automatiquement si ça plante
+
+  # -----------------------------------------------------------
+  # SERVICE 8 : DASHBOARD STREAMLIT (Visualisation)
+  # Rôle : Affiche les données Gold en temps réel
+  # Interface web : http://localhost:8501
+  # Construit depuis : ./dashboard/Dockerfile
+  # -----------------------------------------------------------
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: streamlit-dashboard
+    ports:
+      - "8501:8501"   # Dashboard Streamlit
+    environment:
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - GOLD_TOP_PATH=${GOLD_TOP_PATH}
+      - GOLD_METRICS_PATH=${GOLD_METRICS_PATH}
+    networks:
+      - lakehouse-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: on-failure

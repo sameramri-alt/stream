@@ -1,0 +1,4 @@
+# Bibliothèques Python nécessaires pour le Producer
+kafka-python==2.0.2       # Pour communiquer avec Redpanda (API Kafka)
+sseclient-py==1.7.2       # Pour lire le flux SSE de Wikipedia
+requests==2.31.0          # Pour les requêtes HTTP
