@@ -194,6 +194,48 @@ services:
       - ./spark/jobs:/opt/spark-jobs
 
   # -----------------------------------------------------------
+  # SERVICE 6b : SPARK SUBMIT (Lancement du Job de Streaming)
+  # Rôle : Lance le script streaming_job.py automatiquement
+  #        et le redémarre si jamais il s'arrête
+  # IMPORTANT : Ce service garantit que le pipeline tourne en
+  #             permanence, même après un redémarrage Docker.
+  # -----------------------------------------------------------
+  spark-submit:
+    image: apache/spark:3.5.1
+    container_name: spark-submit
+    # Télécharge les dépendances et lance le job PySpark
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.1.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+      --conf "spark.jars.ivy=/tmp/.ivy2"
+      --conf "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension"
+      --conf "spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog"
+      /opt/spark-jobs/streaming_job.py
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - REDPANDA_BROKERS=${REDPANDA_BROKERS}
+      - KAFKA_TOPIC=${KAFKA_TOPIC}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - BRONZE_PATH=${BRONZE_PATH}
+      - SILVER_PATH=${SILVER_PATH}
+      - GOLD_TOP_PATH=${GOLD_TOP_PATH}
+      - GOLD_METRICS_PATH=${GOLD_METRICS_PATH}
+      - GOLD_LANG_PATH=${GOLD_LANG_PATH}
+      - GOLD_TIMESERIES_PATH=${GOLD_TIMESERIES_PATH}
+      - CHECKPOINT_PATH=${CHECKPOINT_PATH}
+    networks:
+      - lakehouse-net
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+    depends_on:
+      - spark-master
+      - spark-worker
+    restart: always   # Redémarre TOUJOURS en cas d'arrêt ou de crash
+
+  # -----------------------------------------------------------
   # SERVICE 7 : PRODUCER PYTHON (Ingestion Wikipedia)
   # Rôle : Lit le flux SSE Wikipedia et publie dans Redpanda
   # Construit depuis : ./producer/Dockerfile
@@ -233,6 +275,8 @@ services:
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
       - GOLD_TOP_PATH=${GOLD_TOP_PATH}
       - GOLD_METRICS_PATH=${GOLD_METRICS_PATH}
+      - GOLD_LANG_PATH=${GOLD_LANG_PATH}
+      - GOLD_TIMESERIES_PATH=${GOLD_TIMESERIES_PATH}
     networks:
       - lakehouse-net
     depends_on:

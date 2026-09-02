@@ -4,6 +4,9 @@
 
 # Variables d'environnement (contient des mots de passe !)
 .env
+.env.*
+!.env.example
+
 
 # Données MinIO locales (trop lourdes pour GitHub)
 minio_data/
